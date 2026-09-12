@@ -14,7 +14,7 @@ import requests
 import uvicorn
 import xgboost as xgb
 
-app = FastAPI(title="PumpRadarAI", version="3.2")
+app = FastAPI(title="PumpRadarAI - Early Accumulation Engine", version="4.0")
 
 BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "pump_radar_model.json"
@@ -49,7 +49,7 @@ def save_json(path: Path, data: list):
 
 def load_model() -> xgb.XGBClassifier:
     model = xgb.XGBClassifier(
-        n_estimators=100, max_depth=5, learning_rate=0.05, eval_metric="logloss", random_state=42
+        n_estimators=100, max_depth=4, learning_rate=0.05, eval_metric="logloss", random_state=42
     )
     if MODEL_PATH.exists():
         model.load_model(MODEL_PATH)
@@ -89,7 +89,7 @@ def track_peak_and_finalize():
                         status_emoji = "🚀 [УСПІШНИЙ ПАМП]" if is_pump else "❌ [НЕ ПАМПНУВСЯ]"
                         
                         result_msg = (
-                            f"📊 <b>ЗВІТ СИГНАЛУ (30m Peak)</b>\n\n"
+                            f"📊 <b>ЗВІТ РАННЬОГО СИГНАЛУ (30m)</b>\n\n"
                             f"<b>Токен:</b> {item['ticker']}\n"
                             f"<b>Вхідний Score:</b> {item['score']:.1f}%\n"
                             f"<b>🔥 Макс. Ріст (ATH):</b> +{max_gain_pct:.1f}%\n"
@@ -114,10 +114,7 @@ def track_peak_and_finalize():
     save_json(DATASET_PATH, history)
 
 def fetch_target_tokens() -> list:
-    """Збирає до 50 монет із двох джерел: Boosts + Свіжі профілі"""
     addresses = set()
-    
-    # 1. Трендові / Boosted токени
     try:
         r1 = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=5)
         if r1.status_code == 200:
@@ -127,7 +124,6 @@ def fetch_target_tokens() -> list:
     except Exception as e:
         print(f"[FETCH ERROR 1] {e}")
 
-    # 2. Найсвіжіші створені профілі (нові монети)
     try:
         r2 = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=5)
         if r2.status_code == 200:
@@ -141,12 +137,11 @@ def fetch_target_tokens() -> list:
 
 def auto_scan_and_alert():
     try:
-        print("\n[SCANNER] Перевірка розширеного ринку (до 50 монет)...")
+        print("\n[SCANNER] Перевірка монет на тихий закуп (ранній старт)...")
         addresses = fetch_target_tokens()
         if not addresses:
             return
 
-        # DEXScreener API підтримує до 30 адрес в одному GET-запиті
         chunk_size = 30
         pairs_data = []
         for i in range(0, len(addresses), chunk_size):
@@ -169,15 +164,23 @@ def auto_scan_and_alert():
             
             mcap = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
             v5m = float(pair.get("volume", {}).get("m5") or 0.0)
+            price_change_5m = float(pair.get("priceChange", {}).get("m5") or 0.0)
+            
             tx5m = pair.get("txns", {}).get("m5", {})
             buys = int(tx5m.get("buys", 0))
             sells = int(tx5m.get("sells", 0))
             price_usd = float(pair.get("priceUsd", 0))
             
-            if mcap == 0:
-                mcap = float(pair.get("liquidity", {}).get("usd", 0) * 2 or 10000.0)
-            if v5m == 0:
-                v5m = float(pair.get("volume", {}).get("h1", 0) / 12)
+            # ФІЛЬТР 1: Беремо тільки дно ($3k - $40k MCap)
+            if not (3000 <= mcap <= 40000):
+                continue
+
+            # ФІЛЬТР 2: Ціна ще НЕ повинна була вистрілити (від -10% до +25%)
+            if price_change_5m > 25.0:
+                continue
+
+            buy_ratio = float(buys / (sells + 1))
+            vol_mcap_ratio = float(v5m / (mcap + 1))
 
             symbol = pair.get("baseToken", {}).get("symbol") or addr[:8]
             pair_url = pair.get("url") or f"https://dexscreener.com/search?q={addr}"
@@ -191,14 +194,17 @@ def auto_scan_and_alert():
                 "volume_5m": v5m,
                 "buys_5m": buys,
                 "sells_5m": sells,
-                "top10_pct": 20.0
+                "price_change_5m": price_change_5m,
+                "buy_ratio": buy_ratio,
+                "vol_mcap_ratio": vol_mcap_ratio
             })
 
         if not parsed_tokens:
             return
 
         df = pd.DataFrame(parsed_tokens)
-        features = df[["mcap", "volume_5m", "buys_5m", "sells_5m", "top10_pct"]]
+        feature_cols = ["mcap", "volume_5m", "buys_5m", "sells_5m", "price_change_5m", "buy_ratio", "vol_mcap_ratio"]
+        features = df[feature_cols]
 
         if MODEL_PATH.exists():
             model = load_model()
@@ -211,17 +217,20 @@ def auto_scan_and_alert():
                 tok = parsed_tokens[idx]
                 score_pct = float(prob * 100)
                 
-                if prob >= 0.75 and tok["address"] not in tracked_addrs:
-                    print(f"🔥 [PUMP ALERT] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f}")
+                # Порог спрацювання 70% на ранньому накопиченні
+                if prob >= 0.70 and tok["address"] not in tracked_addrs:
+                    print(f"💎 [EARLY ACCUMULATION ALERT] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f}")
                     
                     msg = (
-                        f"🚀 <b>PUMP ALERT!</b>\n\n"
+                        f"💎 <b>РAННІЙ СИГНАЛ (НАКОПИЧЕННЯ)</b>\n\n"
                         f"<b>Токен:</b> {tok['ticker']}\n"
-                        f"<b>Ймовірність пампа:</b> {score_pct:.1f}%\n"
+                        f"<b>Score моделі:</b> {score_pct:.1f}%\n"
                         f"<b>MCap:</b> ${tok['mcap']:,.0f}\n"
-                        f"<b>Об'єм 5хв:</b> ${tok['volume_5m']:,.0f}\n\n"
+                        f"<b>Зміна ціни 5m:</b> {tok['price_change_5m']:+.1f}%\n"
+                        f"<b>Buy/Sell Ratio:</b> {tok['buy_ratio']:.1f}x\n"
+                        f"<b>Об'єм 5m:</b> ${tok['volume_5m']:,.0f}\n\n"
                         f"<b>Адреса:</b> <code>{tok['address']}</code>\n"
-                        f"🔗 <a href='{tok['url']}'>Відкрити на DexScreener</a>"
+                        f"🔗 <a href='{tok['url']}'>Відкрити графік</a>"
                     )
                     send_telegram_alert(msg)
 
@@ -238,12 +247,14 @@ def auto_scan_and_alert():
                             "volume_5m": float(tok["volume_5m"]),
                             "buys_5m": int(tok["buys_5m"]),
                             "sells_5m": int(tok["sells_5m"]),
-                            "top10_pct": float(tok["top10_pct"])
+                            "price_change_5m": float(tok["price_change_5m"]),
+                            "buy_ratio": float(tok["buy_ratio"]),
+                            "vol_mcap_ratio": float(tok["vol_mcap_ratio"])
                         }
                     })
                     save_json(TRACKING_PATH, pending_tracks)
                 else:
-                    print(f"[SCAN] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f}")
+                    print(f"[SCAN] {tok['ticker']} | Score: {score_pct:.1f}% | 5m Change: {tok['price_change_5m']:+.1f}%")
 
     except Exception as e:
         print(f"[SCAN ERROR] {e}")
@@ -263,31 +274,14 @@ def root():
         "telegram_configured": TELEGRAM_BOT_TOKEN != "ВАШ_ТЕЛЕГРАМ_ТОКЕН"
     }
 
-@app.get("/export/model")
-def export_model():
+# ЕНДПОІНТ ДЛЯ ПОВНОГО СКАСУВАННЯ ТА ЗAЧИСТКИ СТАРОЇ ІСТОРІЇ
+@app.post("/reset-history")
+def reset_history():
+    save_json(DATASET_PATH, [])
+    save_json(TRACKING_PATH, [])
     if MODEL_PATH.exists():
-        return FileResponse(MODEL_PATH, filename="pump_radar_model.json")
-    raise HTTPException(status_code=404, detail="Файл моделі відсутній")
-
-@app.get("/export/history")
-def export_history():
-    if DATASET_PATH.exists():
-        return FileResponse(DATASET_PATH, filename="pump_history.json")
-    raise HTTPException(status_code=404, detail="Файл історії відсутній")
-
-@app.post("/import/model")
-async def import_model(file: UploadFile = File(...)):
-    content = await file.read()
-    with open(MODEL_PATH, "wb") as f:
-        f.write(content)
-    return {"status": "Модель успішно імпортовано"}
-
-@app.post("/import/history")
-async def import_history(file: UploadFile = File(...)):
-    content = await file.read()
-    with open(DATASET_PATH, "wb") as f:
-        f.write(content)
-    return {"status": "Історію успішно імпортовано"}
+        os.remove(MODEL_PATH)
+    return {"status": "success", "message": "Історію та стару модель повністю вилучено. Готово до нового збору з нуля!"}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
