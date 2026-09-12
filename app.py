@@ -67,7 +67,7 @@ def save_history_data(data: list):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def auto_scan_and_alert():
-    """Автоматична функція фонового сканування DEX з повністю динамічними метриками"""
+    """Автоматична функція фонового сканування DEX з посиланнями та адресами"""
     try:
         print("\n[SCANNER] Початок перевірки ринку...")
         
@@ -93,7 +93,6 @@ def auto_scan_and_alert():
             addr = t.get("tokenAddress", "")
             pair = pairs_dict.get(addr, {})
             
-            # Повністю динамічні показники
             mcap = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
             v5m = float(pair.get("volume", {}).get("m5") or 0.0)
             
@@ -101,16 +100,18 @@ def auto_scan_and_alert():
             buys = int(tx5m.get("buys", 0))
             sells = int(tx5m.get("sells", 0))
             
-            # Автоматичний перерахунок у разі відсутності базового поля m5/mcap
             if mcap == 0:
                 mcap = float(pair.get("liquidity", {}).get("usd", 0) * 2 or 10000.0)
             if v5m == 0:
                 v5m = float(pair.get("volume", {}).get("h1", 0) / 12)
 
             symbol = pair.get("baseToken", {}).get("symbol") or addr[:8]
+            pair_url = pair.get("url") or f"https://dexscreener.com/search?q={addr}"
 
             parsed_tokens.append({
                 "ticker": symbol,
+                "address": addr,
+                "url": pair_url,
                 "mcap": mcap,
                 "volume_5m": v5m,
                 "buys_5m": buys,
@@ -142,7 +143,9 @@ def auto_scan_and_alert():
                         f"<b>Токен:</b> {tok['ticker']}\n"
                         f"<b>Ймовірність пампа:</b> {score_pct:.1f}%\n"
                         f"<b>MCap:</b> ${tok['mcap']:,.0f}\n"
-                        f"<b>Об'єм 5хв:</b> ${tok['volume_5m']:,.0f}"
+                        f"<b>Об'єм 5хв:</b> ${tok['volume_5m']:,.0f}\n\n"
+                        f"<b>Адреса:</b> <code>{tok['address']}</code>\n"
+                        f"🔗 <a href='{tok['url']}'>Відкрити на DexScreener</a>"
                     )
                     send_telegram_alert(msg)
                 else:
