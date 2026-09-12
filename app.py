@@ -15,7 +15,7 @@ import requests
 import uvicorn
 import xgboost as xgb
 
-app = FastAPI(title="PumpRadarAI - Paper Trading Engine", version="5.1")
+app = FastAPI(title="PumpRadarAI - Paper Trading Engine", version="5.2")
 
 BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent
 ROOT_DIR = Path(__file__).resolve().parent
@@ -107,26 +107,45 @@ def track_peak_and_finalize():
                     current_gain_pct = float(((current_price - entry) / entry * 100) if entry > 0 else 0.0)
 
                     if item.get("paper_trade"):
-                        if max_gain_pct >= 100.0 and not item["paper_trade"]["take1_hit"]:
+                        # Take 1: +100% (2x) -> Продаж 50% ($5) -> Повертаємо $10.0
+                        if max_gain_pct >= 100.0 and not item["paper_trade"].get("take1_hit"):
                             item["paper_trade"]["take1_hit"] = True
                             portfolio["balance"] += 10.0
                             portfolio["total_realized_pnl"] += 5.0
+                            save_portfolio(portfolio)
                             send_telegram_alert(
-                                f"🎯 <b>PAPER TRADE: TAKE 1 HIT (2x)</b>\n\n"
+                                f"🎯 <b>PAPER TRADE: TAKE 1 HIT (2x / +100%)</b>\n\n"
                                 f"<b>Токен:</b> {item['ticker']}\n"
                                 f"<b>Дія:</b> Продано 50% ($5.0)\n"
-                                f"<b>Повернуто в банк:</b> $10.0\n"
+                                f"<b>Повернуто в банк:</b> +$10.0\n"
                                 f"💰 <b>Баланс:</b> ${portfolio['balance']:.2f}"
                             )
 
-                        if max_gain_pct >= 400.0 and not item["paper_trade"]["take2_hit"]:
+                        # Take 2: +800% (9x) -> Продаж 30% ($3) -> Забираємо $27.0
+                        if max_gain_pct >= 800.0 and not item["paper_trade"].get("take2_hit"):
                             item["paper_trade"]["take2_hit"] = True
-                            portfolio["balance"] += 12.5
-                            portfolio["total_realized_pnl"] += 10.0
+                            portfolio["balance"] += 27.0
+                            portfolio["total_realized_pnl"] += 24.0
+                            save_portfolio(portfolio)
                             send_telegram_alert(
-                                f"🚀 <b>PAPER TRADE: TAKE 2 HIT (5x)</b>\n\n"
+                                f"🚀 <b>PAPER TRADE: TAKE 2 HIT (9x / +800%)</b>\n\n"
                                 f"<b>Токен:</b> {item['ticker']}\n"
-                                f"<b>Дія:</b> Продано 25% ($2.5)\n"
+                                f"<b>Дія:</b> Продано 30% ($3.0)\n"
+                                f"<b>Зараховано:</b> +$27.0\n"
+                                f"💰 <b>Баланс:</b> ${portfolio['balance']:.2f}"
+                            )
+
+                        # Take 3: +1500% (16x) -> Продаж 20% ($2) -> Забираємо $32.0
+                        if max_gain_pct >= 1500.0 and not item["paper_trade"].get("take3_hit"):
+                            item["paper_trade"]["take3_hit"] = True
+                            portfolio["balance"] += 32.0
+                            portfolio["total_realized_pnl"] += 30.0
+                            save_portfolio(portfolio)
+                            send_telegram_alert(
+                                f"🌕 <b>PAPER TRADE: TAKE 3 MOONBAG (16x / +1500%)</b>\n\n"
+                                f"<b>Токен:</b> {item['ticker']}\n"
+                                f"<b>Дія:</b> Фінал Moonbag 20% ($2.0)\n"
+                                f"<b>Зараховано:</b> +$32.0\n"
                                 f"💰 <b>Баланс:</b> ${portfolio['balance']:.2f}"
                             )
 
@@ -276,7 +295,12 @@ def auto_scan_and_alert():
                         "ticker": str(tok["ticker"]), "address": str(tok["address"]), "url": str(tok["url"]),
                         "score": float(score_pct), "entry_price": float(tok["price"]), "max_price": float(tok["price"]),
                         "start_time": datetime.now().isoformat(),
-                        "paper_trade": {"position_usd": 10.0, "take1_hit": False, "take2_hit": False},
+                        "paper_trade": {
+                            "position_usd": 10.0, 
+                            "take1_hit": False, 
+                            "take2_hit": False,
+                            "take3_hit": False
+                        },
                         "metrics": tok
                     })
                     save_json(TRACKING_PATH, pending_tracks)
@@ -321,6 +345,18 @@ async def upload_model(file: UploadFile = File(...)):
     with open(dest_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     return {"status": "success", "message": f"Модель успішно завантажено в {dest_path}"}
+
+@app.post("/reset_portfolio")
+def reset_portfolio():
+    default_portfolio = {
+        "balance": 10000.0,
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_realized_pnl": 0.0
+    }
+    save_portfolio(default_portfolio)
+    return {"status": "success", "message": "Портфель успішно скинуто до $10,000", "portfolio": default_portfolio}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
