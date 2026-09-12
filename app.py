@@ -67,27 +67,46 @@ def save_history_data(data: list):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def auto_scan_and_alert():
-    """Автоматична функція фонового сканування DEX"""
+    """Автоматична функція фонового сканування DEX з реальними даними"""
     try:
         print("\n[SCANNER] Початок перевірки ринку...")
         
-        # Отримуємо свіжі трендові токени з DexScreener API
         response = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=10)
         if response.status_code != 200:
             print(f"[SCANNER] Помилка API DexScreener: {response.status_code}")
             return
         
-        tokens_data = response.json()[:10] # Беремо топ-10
+        tokens_data = response.json()[:10]
         parsed_tokens = []
         
+        addresses = [t.get("tokenAddress") for t in tokens_data if t.get("tokenAddress")]
+        if not addresses:
+            print("[SCANNER] Не знайдено адрес токенів.")
+            return
+            
+        pairs_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{','.join(addresses[:10])}", timeout=10)
+        pairs_data = pairs_res.json().get("pairs", []) if pairs_res.status_code == 200 else []
+        
+        pairs_dict = {p.get("baseToken", {}).get("address"): p for p in pairs_data if p.get("baseToken")}
+
         for t in tokens_data:
+            addr = t.get("tokenAddress", "")
+            pair = pairs_dict.get(addr, {})
+            
+            mcap = float(pair.get("marketCap") or pair.get("fdv") or 50000.0)
+            v5m = float(pair.get("volume", {}).get("m5") or 1000.0)
+            tx5m = pair.get("txns", {}).get("m5", {})
+            buys = int(tx5m.get("buys") or 5)
+            sells = int(tx5m.get("sells") or 5)
+            symbol = pair.get("baseToken", {}).get("symbol") or addr[:8]
+
             parsed_tokens.append({
-                "ticker": t.get("tokenAddress", "UNKNOWN")[:8],
-                "mcap": 150000.0,
-                "volume_5m": 25000.0,
-                "buys_5m": 80,
-                "sells_5m": 15,
-                "top10_pct": 25.0
+                "ticker": symbol,
+                "mcap": mcap,
+                "volume_5m": v5m,
+                "buys_5m": buys,
+                "sells_5m": sells,
+                "top10_pct": 20.0
             })
             
         if not parsed_tokens:
@@ -107,8 +126,8 @@ def auto_scan_and_alert():
                 tok = parsed_tokens[idx]
                 score_pct = prob * 100
                 
-                if prob >= 0.75: # Поріг спрацювання сигналу
-                    print(f"🔥 [PUMP DETECTED] {tok['ticker']} | Score: {score_pct:.1f}%")
+                if prob >= 0.75:
+                    print(f"🔥 [PUMP DETECTED] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f}")
                     msg = (
                         f"🚀 <b>PUMP ALERT!</b>\n\n"
                         f"<b>Токен:</b> {tok['ticker']}\n"
@@ -118,7 +137,7 @@ def auto_scan_and_alert():
                     )
                     send_telegram_alert(msg)
                 else:
-                    print(f"[SKIP] {tok['ticker']} | Score: {score_pct:.1f}%")
+                    print(f"[SKIP] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f}")
         else:
             print("[SCANNER] Файл моделі не знайдено на диску.")
 
