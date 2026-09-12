@@ -14,12 +14,13 @@ import requests
 import uvicorn
 import xgboost as xgb
 
-app = FastAPI(title="PumpRadarAI - Early Accumulation Engine", version="4.2")
+app = FastAPI(title="PumpRadarAI - Paper Trading Engine", version="5.0")
 
 BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "pump_radar_model.json"
 DATASET_PATH = BASE_DIR / "pump_history.json"
 TRACKING_PATH = BASE_DIR / "pending_tracks.json"
+PORTFOLIO_PATH = BASE_DIR / "paper_portfolio.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТЕЛЕГРАМ_ТОКЕН")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ВАШ_CHAT_ID")
@@ -47,6 +48,19 @@ def save_json(path: Path, data: list):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def load_portfolio() -> dict:
+    if PORTFOLIO_PATH.exists():
+        try:
+            with open(PORTFOLIO_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"balance": 10000.0, "total_trades": 0, "wins": 0, "losses": 0, "total_realized_pnl": 0.0}
+
+def save_portfolio(portfolio: dict):
+    with open(PORTFOLIO_PATH, "w", encoding="utf-8") as f:
+        json.dump(portfolio, f, ensure_ascii=False, indent=2)
+
 def load_model() -> xgb.XGBClassifier:
     model = xgb.XGBClassifier(
         n_estimators=100, max_depth=4, learning_rate=0.05, eval_metric="logloss", random_state=42
@@ -63,6 +77,7 @@ def track_peak_and_finalize():
     now = datetime.now()
     still_pending = []
     history = load_json(DATASET_PATH)
+    portfolio = load_portfolio()
 
     for item in pending:
         start_time = datetime.fromisoformat(item["start_time"])
@@ -77,24 +92,60 @@ def track_peak_and_finalize():
                     
                     if current_price > item["max_price"]:
                         item["max_price"] = current_price
+
+                    entry = item["entry_price"]
+                    max_p = item["max_price"]
                     
+                    max_gain_pct = float(((max_p - entry) / entry * 100) if entry > 0 else 0.0)
+                    current_gain_pct = float(((current_price - entry) / entry * 100) if entry > 0 else 0.0)
+
+                    # PAPER TRADING LOGIC ($10 Position)
+                    if item.get("paper_trade"):
+                        # Take 1: +100% (2x) -> Sell 50% ($5 initial -> $10 returns)
+                        if max_gain_pct >= 100.0 and not item["paper_trade"]["take1_hit"]:
+                            item["paper_trade"]["take1_hit"] = True
+                            portfolio["balance"] += 10.0  # Safe body returned
+                            portfolio["total_realized_pnl"] += 5.0
+                            send_telegram_alert(
+                                f"🎯 <b>PAPER TRADE: TAKE 1 HIT (2x)</b>\n\n"
+                                f"<b>Токен:</b> {item['ticker']}\n"
+                                f"<b>Дія:</b> Продано 50% ($5.0)\n"
+                                f"<b>Повернуто в банк:</b> $10.0 (Безризикова позиція!)\n"
+                                f"💰 <b>Баланс портфеля:</b> ${portfolio['balance']:.2f}"
+                            )
+
+                        # Take 2: +400% (5x) -> Sell 25% ($2.5 initial -> $12.5 returns)
+                        if max_gain_pct >= 400.0 and not item["paper_trade"]["take2_hit"]:
+                            item["paper_trade"]["take2_hit"] = True
+                            portfolio["balance"] += 12.5
+                            portfolio["total_realized_pnl"] += 10.0
+                            send_telegram_alert(
+                                f"🚀 <b>PAPER TRADE: TAKE 2 HIT (5x)</b>\n\n"
+                                f"<b>Токен:</b> {item['ticker']}\n"
+                                f"<b>Дія:</b> Продано 25% ($2.5)\n"
+                                f"<b>Отримано:</b> $12.5\n"
+                                f"💰 <b>Баланс портфеля:</b> ${portfolio['balance']:.2f}"
+                            )
+
+                    # 30-min Finalize
                     if now - start_time >= timedelta(minutes=30):
-                        entry = item["entry_price"]
-                        max_p = item["max_price"]
-                        
-                        max_gain_pct = float(((max_p - entry) / entry * 100) if entry > 0 else 0.0)
-                        final_gain_pct = float(((current_price - entry) / entry * 100) if entry > 0 else 0.0)
-                        
                         is_pump = 1 if max_gain_pct >= 50.0 else 0
                         status_emoji = "🚀 [УСПІШНИЙ ПАМП]" if is_pump else "❌ [НЕ ПАМПНУВСЯ]"
                         
+                        if is_pump:
+                            portfolio["wins"] += 1
+                        else:
+                            portfolio["losses"] += 1
+                        portfolio["total_trades"] += 1
+
                         result_msg = (
                             f"📊 <b>ЗВІТ РАННЬОГО СИГНАЛУ (30m)</b>\n\n"
                             f"<b>Токен:</b> {item['ticker']}\n"
                             f"<b>Вхідний Score:</b> {item.get('score', 0):.1f}%\n"
                             f"<b>🔥 Макс. Ріст (ATH):</b> +{max_gain_pct:.1f}%\n"
-                            f"<b>Поточний стан:</b> {final_gain_pct:+.1f}%\n"
+                            f"<b>Поточний стан:</b> {current_gain_pct:+.1f}%\n"
                             f"<b>Результат:</b> {status_emoji}\n\n"
+                            f"💼 <b>Paper Portfolio:</b> ${portfolio['balance']:.2f} | Wins: {portfolio['wins']}/{portfolio['total_trades']}\n"
                             f"🔗 <a href='{item['url']}'>Відкрити графік</a>"
                         )
                         send_telegram_alert(result_msg)
@@ -102,7 +153,6 @@ def track_peak_and_finalize():
                         record = item["metrics"]
                         record["is_pump"] = is_pump
                         history.append(record)
-                        print(f"[TRACK COMPLETE] {item['ticker']} записано в історію (is_pump={is_pump})")
                     else:
                         still_pending.append(item)
             else:
@@ -113,6 +163,7 @@ def track_peak_and_finalize():
 
     save_json(TRACKING_PATH, still_pending)
     save_json(DATASET_PATH, history)
+    save_portfolio(portfolio)
 
 def fetch_target_tokens() -> list:
     addresses = set()
@@ -141,7 +192,6 @@ def auto_scan_and_alert():
         print("\n[SCANNER] Перевірка монет на тихий закуп (ранній старт)...")
         addresses = fetch_target_tokens()
         if not addresses:
-            print("[SCANNER] Не знайдено адрес для перевірки.")
             return
 
         chunk_size = 30
@@ -173,35 +223,19 @@ def auto_scan_and_alert():
             sells = int(tx5m.get("sells", 0))
             price_usd = float(pair.get("priceUsd", 0))
             
-            # ФІЛЬТР 1: Беремо тільки дно ($3k - $40k MCap)
-            if not (3000 <= mcap <= 40000):
-                continue
-
-            # ФІЛЬТР 2: Ціна ще НЕ повинна була вистрілити (до +25%)
-            if price_change_5m > 25.0:
+            if not (3000 <= mcap <= 40000) or price_change_5m > 25.0:
                 continue
 
             buy_ratio = float(buys / (sells + 1))
             vol_mcap_ratio = float(v5m / (mcap + 1))
-
             symbol = pair.get("baseToken", {}).get("symbol") or addr[:8]
             pair_url = pair.get("url") or f"https://dexscreener.com/search?q={addr}"
 
             parsed_tokens.append({
-                "ticker": symbol,
-                "address": addr,
-                "url": pair_url,
-                "price": price_usd,
-                "mcap": mcap,
-                "volume_5m": v5m,
-                "buys_5m": buys,
-                "sells_5m": sells,
-                "price_change_5m": price_change_5m,
-                "buy_ratio": buy_ratio,
-                "vol_mcap_ratio": vol_mcap_ratio
+                "ticker": symbol, "address": addr, "url": pair_url, "price": price_usd,
+                "mcap": mcap, "volume_5m": v5m, "buys_5m": buys, "sells_5m": sells,
+                "price_change_5m": price_change_5m, "buy_ratio": buy_ratio, "vol_mcap_ratio": vol_mcap_ratio
             })
-
-        print(f"[SCANNER] Перевірено адрес: {len(addresses)} | Підійшло під фільтри $3k-$40k: {len(parsed_tokens)}")
 
         if not parsed_tokens:
             return
@@ -212,6 +246,7 @@ def auto_scan_and_alert():
 
         pending_tracks = load_json(TRACKING_PATH)
         tracked_addrs = {p["address"] for p in pending_tracks}
+        portfolio = load_portfolio()
 
         if MODEL_PATH.exists():
             model = load_model()
@@ -221,64 +256,38 @@ def auto_scan_and_alert():
                 tok = parsed_tokens[idx]
                 score_pct = float(prob * 100)
                 
-                print(f"[SCAN] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f} | 5m: {tok['price_change_5m']:+.1f}%")
-                
                 if prob >= 0.70 and tok["address"] not in tracked_addrs:
-                    print(f"💎 [EARLY ACCUMULATION ALERT] {tok['ticker']} | Score: {score_pct:.1f}%")
-                    
+                    # Open Paper Position ($10)
+                    portfolio["balance"] -= 10.0
+                    save_portfolio(portfolio)
+
                     msg = (
                         f"💎 <b>РAННІЙ СИГНАЛ (НАКОПИЧЕННЯ)</b>\n\n"
                         f"<b>Токен:</b> {tok['ticker']}\n"
                         f"<b>Score моделі:</b> {score_pct:.1f}%\n"
                         f"<b>MCap:</b> ${tok['mcap']:,.0f}\n"
-                        f"<b>Зміна ціни 5m:</b> {tok['price_change_5m']:+.1f}%\n"
-                        f"<b>Buy/Sell Ratio:</b> {tok['buy_ratio']:.1f}x\n"
-                        f"<b>Об'єм 5m:</b> ${tok['volume_5m']:,.0f}\n\n"
-                        f"<b>Адреса:</b> <code>{tok['address']}</code>\n"
+                        f"<b>Buy/Sell Ratio:</b> {tok['buy_ratio']:.1f}x\n\n"
+                        f"💵 <b>Paper Entry:</b> $10.0 відкритий ордер\n"
+                        f"🎯 <b>Target 2x:</b> ${tok['price']*2:.8f}\n"
                         f"🔗 <a href='{tok['url']}'>Відкрити графік</a>"
                     )
                     send_telegram_alert(msg)
 
                     pending_tracks.append({
-                        "ticker": str(tok["ticker"]),
-                        "address": str(tok["address"]),
-                        "url": str(tok["url"]),
-                        "score": float(score_pct),
-                        "entry_price": float(tok["price"]),
-                        "max_price": float(tok["price"]),
+                        "ticker": str(tok["ticker"]), "address": str(tok["address"]), "url": str(tok["url"]),
+                        "score": float(score_pct), "entry_price": float(tok["price"]), "max_price": float(tok["price"]),
                         "start_time": datetime.now().isoformat(),
-                        "metrics": {
-                            "mcap": float(tok["mcap"]),
-                            "volume_5m": float(tok["volume_5m"]),
-                            "buys_5m": int(tok["buys_5m"]),
-                            "sells_5m": int(tok["sells_5m"]),
-                            "price_change_5m": float(tok["price_change_5m"]),
-                            "buy_ratio": float(tok["buy_ratio"]),
-                            "vol_mcap_ratio": float(tok["vol_mcap_ratio"])
-                        }
+                        "paper_trade": {"position_usd": 10.0, "take1_hit": False, "take2_hit": False},
+                        "metrics": tok
                     })
                     save_json(TRACKING_PATH, pending_tracks)
         else:
             for tok in parsed_tokens:
-                print(f"[DATA COLLECT] {tok['ticker']} | MCap: ${tok['mcap']:,.0f} | 5m Change: {tok['price_change_5m']:+.1f}%")
                 if tok["address"] not in tracked_addrs:
                     pending_tracks.append({
-                        "ticker": str(tok["ticker"]),
-                        "address": str(tok["address"]),
-                        "url": str(tok["url"]),
-                        "score": 0.0,
-                        "entry_price": float(tok["price"]),
-                        "max_price": float(tok["price"]),
-                        "start_time": datetime.now().isoformat(),
-                        "metrics": {
-                            "mcap": float(tok["mcap"]),
-                            "volume_5m": float(tok["volume_5m"]),
-                            "buys_5m": int(tok["buys_5m"]),
-                            "sells_5m": int(tok["sells_5m"]),
-                            "price_change_5m": float(tok["price_change_5m"]),
-                            "buy_ratio": float(tok["buy_ratio"]),
-                            "vol_mcap_ratio": float(tok["vol_mcap_ratio"])
-                        }
+                        "ticker": str(tok["ticker"]), "address": str(tok["address"]), "url": str(tok["url"]),
+                        "score": 0.0, "entry_price": float(tok["price"]), "max_price": float(tok["price"]),
+                        "start_time": datetime.now().isoformat(), "metrics": tok
                     })
             save_json(TRACKING_PATH, pending_tracks)
 
@@ -297,16 +306,14 @@ def root():
         "has_model": MODEL_PATH.exists(),
         "history_records": len(load_json(DATASET_PATH)),
         "active_tracks": len(load_json(TRACKING_PATH)),
-        "telegram_configured": TELEGRAM_BOT_TOKEN != "ВАШ_ТЕЛЕГРАМ_ТОКЕН"
+        "paper_portfolio": load_portfolio()
     }
 
-@app.post("/reset-history")
-def reset_history():
-    save_json(DATASET_PATH, [])
-    save_json(TRACKING_PATH, [])
-    if MODEL_PATH.exists():
-        os.remove(MODEL_PATH)
-    return {"status": "success", "message": "Історію та стару модель повністю вилучено. Готово до нового збору з нуля!"}
+@app.get("/get_history")
+def get_history():
+    if DATASET_PATH.exists():
+        return FileResponse(DATASET_PATH, media_type="application/json", filename="pump_history.json")
+    return {"error": "File pump_history.json not found"}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
