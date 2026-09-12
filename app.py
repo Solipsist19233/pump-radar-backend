@@ -14,7 +14,7 @@ import requests
 import uvicorn
 import xgboost as xgb
 
-app = FastAPI(title="PumpRadarAI - Early Accumulation Engine", version="4.0")
+app = FastAPI(title="PumpRadarAI - Early Accumulation Engine", version="4.2")
 
 BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "pump_radar_model.json"
@@ -91,7 +91,7 @@ def track_peak_and_finalize():
                         result_msg = (
                             f"📊 <b>ЗВІТ РАННЬОГО СИГНАЛУ (30m)</b>\n\n"
                             f"<b>Токен:</b> {item['ticker']}\n"
-                            f"<b>Вхідний Score:</b> {item['score']:.1f}%\n"
+                            f"<b>Вхідний Score:</b> {item.get('score', 0):.1f}%\n"
                             f"<b>🔥 Макс. Ріст (ATH):</b> +{max_gain_pct:.1f}%\n"
                             f"<b>Поточний стан:</b> {final_gain_pct:+.1f}%\n"
                             f"<b>Результат:</b> {status_emoji}\n\n"
@@ -102,6 +102,7 @@ def track_peak_and_finalize():
                         record = item["metrics"]
                         record["is_pump"] = is_pump
                         history.append(record)
+                        print(f"[TRACK COMPLETE] {item['ticker']} записано в історію (is_pump={is_pump})")
                     else:
                         still_pending.append(item)
             else:
@@ -140,6 +141,7 @@ def auto_scan_and_alert():
         print("\n[SCANNER] Перевірка монет на тихий закуп (ранній старт)...")
         addresses = fetch_target_tokens()
         if not addresses:
+            print("[SCANNER] Не знайдено адрес для перевірки.")
             return
 
         chunk_size = 30
@@ -175,7 +177,7 @@ def auto_scan_and_alert():
             if not (3000 <= mcap <= 40000):
                 continue
 
-            # ФІЛЬТР 2: Ціна ще НЕ повинна була вистрілити (від -10% до +25%)
+            # ФІЛЬТР 2: Ціна ще НЕ повинна була вистрілити (до +25%)
             if price_change_5m > 25.0:
                 continue
 
@@ -199,6 +201,8 @@ def auto_scan_and_alert():
                 "vol_mcap_ratio": vol_mcap_ratio
             })
 
+        print(f"[SCANNER] Перевірено адрес: {len(addresses)} | Підійшло під фільтри $3k-$40k: {len(parsed_tokens)}")
+
         if not parsed_tokens:
             return
 
@@ -206,20 +210,21 @@ def auto_scan_and_alert():
         feature_cols = ["mcap", "volume_5m", "buys_5m", "sells_5m", "price_change_5m", "buy_ratio", "vol_mcap_ratio"]
         features = df[feature_cols]
 
+        pending_tracks = load_json(TRACKING_PATH)
+        tracked_addrs = {p["address"] for p in pending_tracks}
+
         if MODEL_PATH.exists():
             model = load_model()
             probs = model.predict_proba(features)[:, 1]
             
-            pending_tracks = load_json(TRACKING_PATH)
-            tracked_addrs = {p["address"] for p in pending_tracks}
-
             for idx, prob in enumerate(probs):
                 tok = parsed_tokens[idx]
                 score_pct = float(prob * 100)
                 
-                # Порог спрацювання 70% на ранньому накопиченні
+                print(f"[SCAN] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f} | 5m: {tok['price_change_5m']:+.1f}%")
+                
                 if prob >= 0.70 and tok["address"] not in tracked_addrs:
-                    print(f"💎 [EARLY ACCUMULATION ALERT] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f}")
+                    print(f"💎 [EARLY ACCUMULATION ALERT] {tok['ticker']} | Score: {score_pct:.1f}%")
                     
                     msg = (
                         f"💎 <b>РAННІЙ СИГНАЛ (НАКОПИЧЕННЯ)</b>\n\n"
@@ -253,8 +258,29 @@ def auto_scan_and_alert():
                         }
                     })
                     save_json(TRACKING_PATH, pending_tracks)
-                else:
-                    print(f"[SCAN] {tok['ticker']} | Score: {score_pct:.1f}% | 5m Change: {tok['price_change_5m']:+.1f}%")
+        else:
+            for tok in parsed_tokens:
+                print(f"[DATA COLLECT] {tok['ticker']} | MCap: ${tok['mcap']:,.0f} | 5m Change: {tok['price_change_5m']:+.1f}%")
+                if tok["address"] not in tracked_addrs:
+                    pending_tracks.append({
+                        "ticker": str(tok["ticker"]),
+                        "address": str(tok["address"]),
+                        "url": str(tok["url"]),
+                        "score": 0.0,
+                        "entry_price": float(tok["price"]),
+                        "max_price": float(tok["price"]),
+                        "start_time": datetime.now().isoformat(),
+                        "metrics": {
+                            "mcap": float(tok["mcap"]),
+                            "volume_5m": float(tok["volume_5m"]),
+                            "buys_5m": int(tok["buys_5m"]),
+                            "sells_5m": int(tok["sells_5m"]),
+                            "price_change_5m": float(tok["price_change_5m"]),
+                            "buy_ratio": float(tok["buy_ratio"]),
+                            "vol_mcap_ratio": float(tok["vol_mcap_ratio"])
+                        }
+                    })
+            save_json(TRACKING_PATH, pending_tracks)
 
     except Exception as e:
         print(f"[SCAN ERROR] {e}")
@@ -274,7 +300,6 @@ def root():
         "telegram_configured": TELEGRAM_BOT_TOKEN != "ВАШ_ТЕЛЕГРАМ_ТОКЕН"
     }
 
-# ЕНДПОІНТ ДЛЯ ПОВНОГО СКАСУВАННЯ ТА ЗAЧИСТКИ СТАРОЇ ІСТОРІЇ
 @app.post("/reset-history")
 def reset_history():
     save_json(DATASET_PATH, [])
