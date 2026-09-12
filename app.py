@@ -176,7 +176,7 @@ def auto_scan_and_alert():
                 score_pct = float(prob * 100)
                 
                 if prob >= 0.75 and tok["address"] not in tracked_addrs:
-                    print(f"🔥 [PUMP ALERT] {tok['ticker']} | Score: {score_pct:.1f}%")
+                    print(f"🔥 [PUMP ALERT] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f}")
                     
                     msg = (
                         f"🚀 <b>PUMP ALERT!</b>\n\n"
@@ -206,6 +206,8 @@ def auto_scan_and_alert():
                         }
                     })
                     save_json(TRACKING_PATH, pending_tracks)
+                else:
+                    print(f"[SCAN] {tok['ticker']} | Score: {score_pct:.1f}% | MCap: ${tok['mcap']:,.0f}")
 
     except Exception as e:
         print(f"[SCAN ERROR] {e}")
