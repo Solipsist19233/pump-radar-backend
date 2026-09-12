@@ -20,7 +20,7 @@ BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve()
 MODEL_PATH = BASE_DIR / "pump_radar_model.json"
 DATASET_PATH = BASE_DIR / "pump_history.json"
 
-# Налаштування Telegram (береться з змінних середовища або вкажіть вручну)
+# Налаштування Telegram (береться з змінних середовища)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТЕЛЕГРАМ_ТОКЕН")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ВАШ_CHAT_ID")
 
@@ -32,6 +32,7 @@ def send_telegram_alert(message: str):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=5)
+        print("[TG] Сповіщення успішно надіслано в Telegram")
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
@@ -68,16 +69,18 @@ def save_history_data(data: list):
 def auto_scan_and_alert():
     """Автоматична функція фонового сканування DEX"""
     try:
+        print("\n[SCANNER] Початок перевірки ринку...")
+        
         # Отримуємо свіжі трендові токени з DexScreener API
         response = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=10)
         if response.status_code != 200:
+            print(f"[SCANNER] Помилка API DexScreener: {response.status_code}")
             return
         
         tokens_data = response.json()[:10] # Беремо топ-10
         parsed_tokens = []
         
         for t in tokens_data:
-            # Генерація/збір метрик для моделі
             parsed_tokens.append({
                 "ticker": t.get("tokenAddress", "UNKNOWN")[:8],
                 "mcap": 150000.0,
@@ -88,7 +91,10 @@ def auto_scan_and_alert():
             })
             
         if not parsed_tokens:
+            print("[SCANNER] Токенів для аналізу не знайдено.")
             return
+
+        print(f"[SCANNER] Знайдено {len(parsed_tokens)} токенів. Оцінюю через XGBoost...")
 
         df = pd.DataFrame(parsed_tokens)
         features = df[["mcap", "volume_5m", "buys_5m", "sells_5m", "top10_pct"]]
@@ -98,20 +104,28 @@ def auto_scan_and_alert():
             probs = model.predict_proba(features)[:, 1]
             
             for idx, prob in enumerate(probs):
+                tok = parsed_tokens[idx]
+                score_pct = prob * 100
+                
                 if prob >= 0.75: # Поріг спрацювання сигналу
-                    tok = parsed_tokens[idx]
+                    print(f"🔥 [PUMP DETECTED] {tok['ticker']} | Score: {score_pct:.1f}%")
                     msg = (
                         f"🚀 <b>PUMP ALERT!</b>\n\n"
                         f"<b>Токен:</b> {tok['ticker']}\n"
-                        f"<b>Ймовірність пампа:</b> {prob*100:.1f}%\n"
+                        f"<b>Ймовірність пампа:</b> {score_pct:.1f}%\n"
                         f"<b>MCap:</b> ${tok['mcap']:,.0f}\n"
                         f"<b>Об'єм 5хв:</b> ${tok['volume_5m']:,.0f}"
                     )
                     send_telegram_alert(msg)
+                else:
+                    print(f"[SKIP] {tok['ticker']} | Score: {score_pct:.1f}%")
+        else:
+            print("[SCANNER] Файл моделі не знайдено на диску.")
+
     except Exception as e:
         print(f"[SCAN ERROR] {e}")
 
-# Фоновий планировщик (запуск сканера кожні 60 секунд)
+# Фоновий планувальник (запуск сканера кожні 60 секунд)
 scheduler = BackgroundScheduler()
 scheduler.add_job(auto_scan_and_alert, 'interval', seconds=60)
 scheduler.start()
