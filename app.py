@@ -14,7 +14,7 @@ import requests
 import uvicorn
 import xgboost as xgb
 
-app = FastAPI(title="PumpRadarAI", version="3.0")
+app = FastAPI(title="PumpRadarAI", version="3.1")
 
 BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "pump_radar_model.json"
@@ -56,7 +56,6 @@ def load_model() -> xgb.XGBClassifier:
     return model
 
 def track_peak_and_finalize():
-    """Щохвилини перевіряє ціну, оновлює пік (ATH) та завершує трекінг через 30 хв"""
     pending = load_json(TRACKING_PATH)
     if not pending:
         return
@@ -76,17 +75,15 @@ def track_peak_and_finalize():
                 if pairs:
                     current_price = float(pairs[0].get("priceUsd", 0))
                     
-                    # Фіксація нового максимуму (ATH)
                     if current_price > item["max_price"]:
                         item["max_price"] = current_price
                     
-                    # Перевіряємо чи минуло 30 хвилин спостереження
                     if now - start_time >= timedelta(minutes=30):
                         entry = item["entry_price"]
                         max_p = item["max_price"]
                         
-                        max_gain_pct = ((max_p - entry) / entry * 100) if entry > 0 else 0.0
-                        final_gain_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
+                        max_gain_pct = float(((max_p - entry) / entry * 100) if entry > 0 else 0.0)
+                        final_gain_pct = float(((current_price - entry) / entry * 100) if entry > 0 else 0.0)
                         
                         is_pump = 1 if max_gain_pct >= 50.0 else 0
                         status_emoji = "🚀 [УСПІШНИЙ ПАМП]" if is_pump else "❌ [НЕ ПАМПНУВСЯ]"
@@ -102,7 +99,6 @@ def track_peak_and_finalize():
                         )
                         send_telegram_alert(result_msg)
                         
-                        # Додаємо в базу історії для майбутнього навчання
                         record = item["metrics"]
                         record["is_pump"] = is_pump
                         history.append(record)
@@ -177,9 +173,8 @@ def auto_scan_and_alert():
 
             for idx, prob in enumerate(probs):
                 tok = parsed_tokens[idx]
-                score_pct = prob * 100
+                score_pct = float(prob * 100)
                 
-                # Поріг виклику сигналу та уникнення дублікатів
                 if prob >= 0.75 and tok["address"] not in tracked_addrs:
                     print(f"🔥 [PUMP ALERT] {tok['ticker']} | Score: {score_pct:.1f}%")
                     
@@ -195,19 +190,19 @@ def auto_scan_and_alert():
                     send_telegram_alert(msg)
 
                     pending_tracks.append({
-                        "ticker": tok["ticker"],
-                        "address": tok["address"],
-                        "url": tok["url"],
-                        "score": score_pct,
-                        "entry_price": tok["price"],
-                        "max_price": tok["price"],
+                        "ticker": str(tok["ticker"]),
+                        "address": str(tok["address"]),
+                        "url": str(tok["url"]),
+                        "score": float(score_pct),
+                        "entry_price": float(tok["price"]),
+                        "max_price": float(tok["price"]),
                         "start_time": datetime.now().isoformat(),
                         "metrics": {
-                            "mcap": tok["mcap"],
-                            "volume_5m": tok["volume_5m"],
-                            "buys_5m": tok["buys_5m"],
-                            "sells_5m": tok["sells_5m"],
-                            "top10_pct": tok["top10_pct"]
+                            "mcap": float(tok["mcap"]),
+                            "volume_5m": float(tok["volume_5m"]),
+                            "buys_5m": int(tok["buys_5m"]),
+                            "sells_5m": int(tok["sells_5m"]),
+                            "top10_pct": float(tok["top10_pct"])
                         }
                     })
                     save_json(TRACKING_PATH, pending_tracks)
@@ -215,7 +210,6 @@ def auto_scan_and_alert():
     except Exception as e:
         print(f"[SCAN ERROR] {e}")
 
-# Фоновий планувальник
 scheduler = BackgroundScheduler()
 scheduler.add_job(auto_scan_and_alert, 'interval', seconds=60)
 scheduler.add_job(track_peak_and_finalize, 'interval', seconds=60)
