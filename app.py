@@ -20,7 +20,7 @@ BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve()
 MODEL_PATH = BASE_DIR / "pump_radar_model.json"
 DATASET_PATH = BASE_DIR / "pump_history.json"
 
-# Налаштування Telegram (береться з змінних середовища)
+# Налаштування Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТЕЛЕГРАМ_ТОКЕН")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ВАШ_CHAT_ID")
 
@@ -67,7 +67,7 @@ def save_history_data(data: list):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def auto_scan_and_alert():
-    """Автоматична функція фонового сканування DEX з реальними даними"""
+    """Автоматична функція фонового сканування DEX з повністю динамічними метриками"""
     try:
         print("\n[SCANNER] Початок перевірки ринку...")
         
@@ -93,11 +93,20 @@ def auto_scan_and_alert():
             addr = t.get("tokenAddress", "")
             pair = pairs_dict.get(addr, {})
             
-            mcap = float(pair.get("marketCap") or pair.get("fdv") or 50000.0)
-            v5m = float(pair.get("volume", {}).get("m5") or 1000.0)
+            # Повністю динамічні показники
+            mcap = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
+            v5m = float(pair.get("volume", {}).get("m5") or 0.0)
+            
             tx5m = pair.get("txns", {}).get("m5", {})
-            buys = int(tx5m.get("buys") or 5)
-            sells = int(tx5m.get("sells") or 5)
+            buys = int(tx5m.get("buys", 0))
+            sells = int(tx5m.get("sells", 0))
+            
+            # Автоматичний перерахунок у разі відсутності базового поля m5/mcap
+            if mcap == 0:
+                mcap = float(pair.get("liquidity", {}).get("usd", 0) * 2 or 10000.0)
+            if v5m == 0:
+                v5m = float(pair.get("volume", {}).get("h1", 0) / 12)
+
             symbol = pair.get("baseToken", {}).get("symbol") or addr[:8]
 
             parsed_tokens.append({
