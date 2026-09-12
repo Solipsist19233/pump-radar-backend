@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
+import shutil
 from typing import List, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -14,10 +15,16 @@ import requests
 import uvicorn
 import xgboost as xgb
 
-app = FastAPI(title="PumpRadarAI - Paper Trading Engine", version="5.0")
+app = FastAPI(title="PumpRadarAI - Paper Trading Engine", version="5.1")
 
 BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent
+
+# Перевіряємо модель і в /data, і в корені проєкту
 MODEL_PATH = BASE_DIR / "pump_radar_model.json"
+if not MODEL_PATH.exists() and (ROOT_DIR / "pump_radar_model.json").exists():
+    MODEL_PATH = ROOT_DIR / "pump_radar_model.json"
+
 DATASET_PATH = BASE_DIR / "pump_history.json"
 TRACKING_PATH = BASE_DIR / "pending_tracks.json"
 PORTFOLIO_PATH = BASE_DIR / "paper_portfolio.json"
@@ -99,22 +106,19 @@ def track_peak_and_finalize():
                     max_gain_pct = float(((max_p - entry) / entry * 100) if entry > 0 else 0.0)
                     current_gain_pct = float(((current_price - entry) / entry * 100) if entry > 0 else 0.0)
 
-                    # PAPER TRADING LOGIC ($10 Position)
                     if item.get("paper_trade"):
-                        # Take 1: +100% (2x) -> Sell 50% ($5 initial -> $10 returns)
                         if max_gain_pct >= 100.0 and not item["paper_trade"]["take1_hit"]:
                             item["paper_trade"]["take1_hit"] = True
-                            portfolio["balance"] += 10.0  # Safe body returned
+                            portfolio["balance"] += 10.0
                             portfolio["total_realized_pnl"] += 5.0
                             send_telegram_alert(
                                 f"🎯 <b>PAPER TRADE: TAKE 1 HIT (2x)</b>\n\n"
                                 f"<b>Токен:</b> {item['ticker']}\n"
                                 f"<b>Дія:</b> Продано 50% ($5.0)\n"
-                                f"<b>Повернуто в банк:</b> $10.0 (Безризикова позиція!)\n"
-                                f"💰 <b>Баланс портфеля:</b> ${portfolio['balance']:.2f}"
+                                f"<b>Повернуто в банк:</b> $10.0\n"
+                                f"💰 <b>Баланс:</b> ${portfolio['balance']:.2f}"
                             )
 
-                        # Take 2: +400% (5x) -> Sell 25% ($2.5 initial -> $12.5 returns)
                         if max_gain_pct >= 400.0 and not item["paper_trade"]["take2_hit"]:
                             item["paper_trade"]["take2_hit"] = True
                             portfolio["balance"] += 12.5
@@ -123,11 +127,9 @@ def track_peak_and_finalize():
                                 f"🚀 <b>PAPER TRADE: TAKE 2 HIT (5x)</b>\n\n"
                                 f"<b>Токен:</b> {item['ticker']}\n"
                                 f"<b>Дія:</b> Продано 25% ($2.5)\n"
-                                f"<b>Отримано:</b> $12.5\n"
-                                f"💰 <b>Баланс портфеля:</b> ${portfolio['balance']:.2f}"
+                                f"💰 <b>Баланс:</b> ${portfolio['balance']:.2f}"
                             )
 
-                    # 30-min Finalize
                     if now - start_time >= timedelta(minutes=30):
                         is_pump = 1 if max_gain_pct >= 50.0 else 0
                         status_emoji = "🚀 [УСПІШНИЙ ПАМП]" if is_pump else "❌ [НЕ ПАМПНУВСЯ]"
@@ -189,7 +191,6 @@ def fetch_target_tokens() -> list:
 
 def auto_scan_and_alert():
     try:
-        print("\n[SCANNER] Перевірка монет на тихий закуп (ранній старт)...")
         addresses = fetch_target_tokens()
         if not addresses:
             return
@@ -257,7 +258,6 @@ def auto_scan_and_alert():
                 score_pct = float(prob * 100)
                 
                 if prob >= 0.70 and tok["address"] not in tracked_addrs:
-                    # Open Paper Position ($10)
                     portfolio["balance"] -= 10.0
                     save_portfolio(portfolio)
 
@@ -267,8 +267,7 @@ def auto_scan_and_alert():
                         f"<b>Score моделі:</b> {score_pct:.1f}%\n"
                         f"<b>MCap:</b> ${tok['mcap']:,.0f}\n"
                         f"<b>Buy/Sell Ratio:</b> {tok['buy_ratio']:.1f}x\n\n"
-                        f"💵 <b>Paper Entry:</b> $10.0 відкритий ордер\n"
-                        f"🎯 <b>Target 2x:</b> ${tok['price']*2:.8f}\n"
+                        f"💵 <b>Paper Entry:</b> $10.0 ордер\n"
                         f"🔗 <a href='{tok['url']}'>Відкрити графік</a>"
                     )
                     send_telegram_alert(msg)
@@ -304,6 +303,7 @@ def root():
     return {
         "status": "online",
         "has_model": MODEL_PATH.exists(),
+        "model_location": str(MODEL_PATH) if MODEL_PATH.exists() else "None",
         "history_records": len(load_json(DATASET_PATH)),
         "active_tracks": len(load_json(TRACKING_PATH)),
         "paper_portfolio": load_portfolio()
@@ -314,6 +314,13 @@ def get_history():
     if DATASET_PATH.exists():
         return FileResponse(DATASET_PATH, media_type="application/json", filename="pump_history.json")
     return {"error": "File pump_history.json not found"}
+
+@app.post("/upload_model")
+async def upload_model(file: UploadFile = File(...)):
+    dest_path = BASE_DIR / "pump_radar_model.json"
+    with open(dest_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    return {"status": "success", "message": f"Модель успішно завантажено в {dest_path}"}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
