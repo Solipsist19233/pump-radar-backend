@@ -14,7 +14,7 @@ import requests
 import uvicorn
 import xgboost as xgb
 
-app = FastAPI(title="PumpRadarAI", version="3.1")
+app = FastAPI(title="PumpRadarAI", version="3.2")
 
 BASE_DIR = Path("/data") if Path("/data").exists() else Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "pump_radar_model.json"
@@ -113,26 +113,59 @@ def track_peak_and_finalize():
     save_json(TRACKING_PATH, still_pending)
     save_json(DATASET_PATH, history)
 
+def fetch_target_tokens() -> list:
+    """Збирає до 50 монет із двох джерел: Boosts + Свіжі профілі"""
+    addresses = set()
+    
+    # 1. Трендові / Boosted токени
+    try:
+        r1 = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=5)
+        if r1.status_code == 200:
+            for item in r1.json()[:30]:
+                if item.get("tokenAddress"):
+                    addresses.add(item.get("tokenAddress"))
+    except Exception as e:
+        print(f"[FETCH ERROR 1] {e}")
+
+    # 2. Найсвіжіші створені профілі (нові монети)
+    try:
+        r2 = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=5)
+        if r2.status_code == 200:
+            for item in r2.json()[:30]:
+                if item.get("tokenAddress"):
+                    addresses.add(item.get("tokenAddress"))
+    except Exception as e:
+        print(f"[FETCH ERROR 2] {e}")
+
+    return list(addresses)[:50]
+
 def auto_scan_and_alert():
     try:
-        print("\n[SCANNER] Перевірка ринку...")
-        response = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=10)
-        if response.status_code != 200:
-            return
-        
-        tokens_data = response.json()[:10]
-        addresses = [t.get("tokenAddress") for t in tokens_data if t.get("tokenAddress")]
+        print("\n[SCANNER] Перевірка розширеного ринку (до 50 монет)...")
+        addresses = fetch_target_tokens()
         if not addresses:
             return
-            
-        pairs_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{','.join(addresses[:10])}", timeout=10)
-        pairs_data = pairs_res.json().get("pairs", []) if pairs_res.status_code == 200 else []
-        pairs_dict = {p.get("baseToken", {}).get("address"): p for p in pairs_data if p.get("baseToken")}
+
+        # DEXScreener API підтримує до 30 адрес в одному GET-запиті
+        chunk_size = 30
+        pairs_data = []
+        for i in range(0, len(addresses), chunk_size):
+            chunk = addresses[i:i + chunk_size]
+            pairs_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}", timeout=10)
+            if pairs_res.status_code == 200:
+                pairs_data.extend(pairs_res.json().get("pairs", []) or [])
+
+        pairs_dict = {}
+        for p in pairs_data:
+            base_addr = p.get("baseToken", {}).get("address")
+            if base_addr and base_addr not in pairs_dict:
+                pairs_dict[base_addr] = p
 
         parsed_tokens = []
-        for t in tokens_data:
-            addr = t.get("tokenAddress", "")
+        for addr in addresses:
             pair = pairs_dict.get(addr, {})
+            if not pair:
+                continue
             
             mcap = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
             v5m = float(pair.get("volume", {}).get("m5") or 0.0)
@@ -160,6 +193,9 @@ def auto_scan_and_alert():
                 "sells_5m": sells,
                 "top10_pct": 20.0
             })
+
+        if not parsed_tokens:
+            return
 
         df = pd.DataFrame(parsed_tokens)
         features = df[["mcap", "volume_5m", "buys_5m", "sells_5m", "top10_pct"]]
